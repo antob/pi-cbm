@@ -6,10 +6,12 @@ const SETTINGS_FILE_NAME = "pi-cbm-settings.json";
 
 export interface CbmSettings {
   autoIndexNonGitDirectories?: boolean;
+  showFooterStatus?: boolean;
 }
 
 const DEFAULT_SETTINGS: Required<CbmSettings> = {
   autoIndexNonGitDirectories: true,
+  showFooterStatus: true,
 };
 
 function getSettingsPath(): string {
@@ -27,6 +29,8 @@ export function loadSettings(): Required<CbmSettings> {
     return {
       autoIndexNonGitDirectories:
         typeof settings.autoIndexNonGitDirectories === "boolean" ? settings.autoIndexNonGitDirectories : DEFAULT_SETTINGS.autoIndexNonGitDirectories,
+      showFooterStatus:
+        typeof settings.showFooterStatus === "boolean" ? settings.showFooterStatus : DEFAULT_SETTINGS.showFooterStatus,
     };
   } catch (error) {
     console.error("Failed to load pi-cbm settings:", error);

@@ -15,19 +15,24 @@ export function registerLifecycle(pi: ExtensionAPI, services: CbmServices) {
     try {
       const result = await services.projects.indexCurrentRepo(ctx.cwd, ctx.signal);
       if (result.status === "skipped") {
-        ctx.ui.setStatus("codebase-memory", `cbm skipped: ${result.reason}`);
+        setFooterStatus(ctx, `cbm skipped: ${result.reason}`);
         return;
       }
 
       const nodes = typeof result.nodes === "number" ? ` · ${result.nodes} nodes` : "";
       const edges = typeof result.edges === "number" ? ` · ${result.edges} edges` : "";
-      ctx.ui.setStatus("codebase-memory", `cbm ${result.project}${nodes}${edges}`);
+      setFooterStatus(ctx, `cbm ${result.project}${nodes}${edges}`);
     } catch (error) {
       const reason = error instanceof Error && error.message ? `: ${error.message}` : "";
-      ctx.ui.setStatus("codebase-memory", `cbm index failed${reason}`);
+      setFooterStatus(ctx, `cbm index failed${reason}`);
     } finally {
       indexInFlight = false;
     }
+  }
+
+  function setFooterStatus(ctx: ExtensionContext, text: string) {
+    services.settings.setLastFooterText(text);
+    ctx.ui.setStatus("codebase-memory", services.settings.showFooterStatus ? text : undefined);
   }
 
   pi.on("before_agent_start", async (event) => ({

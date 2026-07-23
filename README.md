@@ -133,11 +133,15 @@ Most tools accept optional `project`. When omitted, the extension infers it from
 Open the pi-cbm settings menu:
 
 - `/cbm menu` — show the interactive settings menu.
-- `/cbm status` — show auto-index settings.
+- `/cbm status` — show auto-index and footer settings.
 - `/cbm enable-non-git` — auto-index safe non-git working directories.
 - `/cbm disable-non-git` — only auto-index git repositories.
+- `/cbm enable-footer` — show cbm status text in the footer.
+- `/cbm disable-footer` — hide cbm status text in the footer.
 
 Non-git auto-indexing is enabled by default to preserve normal cwd workflows. The unsafe-path guard is always enabled: filesystem roots, home directories, system directories, and common macOS/Linux builtin directories are skipped with a status message explaining why.
+
+Footer status text is enabled by default. Disabling it stops the extension from writing indexing status ("cbm ...") to the footer; indexing itself is unaffected.
 
 Notes:
 
