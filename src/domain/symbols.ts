@@ -5,12 +5,16 @@ import { clampInt } from "../shared/numbers.js";
 import { isRecord, numberProp, removeUndefined, stringProp } from "../shared/object.js";
 import { errorText, escapeRegExp, normalizeForMatch } from "../shared/strings.js";
 import { OutputService, stripOutputControls } from "./output.js";
-import { ProjectService, type ToolExecutionContext } from "./project.js";
+import type { ProjectCatalog } from "./project-catalog.js";
+import type { ProjectResolver, ToolExecutionContext } from "./project-resolver.js";
 
 const MAX_BATCH_SNIPPETS = 50;
 const MAX_BATCH_SYMBOLS = 30;
 const MAX_SEARCH_AND_READ = 20;
 const MAX_SEARCH_LIMIT = 50;
+
+/** 0.12 `search_graph` columns beyond the default `cols` (ignored by `query` search). */
+const SEARCH_GRAPH_FIELDS = ["signature", "parent_class", "start_line", "end_line"];
 
 type BatchCallResult = { data: Record<string, unknown>; stderr: string };
 
@@ -39,9 +43,24 @@ type SymbolResolution = {
 
 type LocationCache = Map<string, Promise<Partial<SearchCandidate>>>;
 
-export function searchCandidates(data: unknown): SearchCandidate[] {
-  if (!isRecord(data) || !Array.isArray(data.results)) return [];
-  return data.results.filter((item): item is SearchCandidate => {
+/**
+ * Normalized `search_graph` data is an object with a `results` array. Anything
+ * else means pi-cbm and codebase-memory-mcp disagree on the wire shape, so fail
+ * loudly instead of reporting an empty "symbol not found".
+ */
+function searchResultRows(data: unknown, tool: string): unknown[] {
+  if (Array.isArray(data)) return data;
+  if (isRecord(data) && Array.isArray(data.results)) return data.results;
+
+  const keys = isRecord(data) ? Object.keys(data).join(", ") || "(none)" : typeof data;
+  throw new Error(
+    `codebase-memory-mcp ${tool} returned an unrecognized result shape: ` +
+      `expected an object with a "results" array, received keys: ${keys}.`,
+  );
+}
+
+export function searchCandidates(data: unknown, tool = "search_graph"): SearchCandidate[] {
+  return searchResultRows(data, tool).filter((item): item is SearchCandidate => {
     if (!isRecord(item) || typeof item.qualified_name !== "string") return false;
     return item.label === "Function" || item.label === "Method" || item.label === undefined;
   });
@@ -58,9 +77,8 @@ export function dedupeCandidates(candidates: SearchCandidate[]): SearchCandidate
   return result;
 }
 
-function allSearchCandidates(data: unknown): SearchCandidate[] {
-  if (!isRecord(data) || !Array.isArray(data.results)) return [];
-  return data.results.filter((item): item is SearchCandidate => isRecord(item) && typeof item.qualified_name === "string");
+function allSearchCandidates(data: unknown, tool = "search_graph"): SearchCandidate[] {
+  return searchResultRows(data, tool).filter((item): item is SearchCandidate => isRecord(item) && typeof item.qualified_name === "string");
 }
 
 function candidateFilePath(candidate: SearchCandidate): string | undefined {
@@ -244,7 +262,8 @@ function neighborDirection(neighbors: "none" | "callers" | "callees" | "both"): 
 export class SymbolService {
   constructor(
     private readonly cbm: CbmClient,
-    private readonly projects: ProjectService,
+    private readonly resolver: ProjectResolver,
+    private readonly catalog: ProjectCatalog,
     private readonly output: OutputService,
   ) {}
 
@@ -265,18 +284,19 @@ export class SymbolService {
         { signal: ctx.signal, timeoutMs: queryTimeoutMs(params.timeout_ms), allowError: true },
       );
       if (!result.ok || !isRecord(result.data)) return {};
+      const snippet = (await this.catalog.relativizePaths(result.data, project, ctx.signal)) as Record<string, unknown>;
       return removeUndefined({
-        name: result.data.name,
-        qualified_name: result.data.qualified_name,
-        label: result.data.label,
-        file_path: result.data.file_path ?? result.data.file ?? result.data.path,
-        start_line: numberProp(result.data, "start_line"),
-        end_line: numberProp(result.data, "end_line"),
-        parent_class: result.data.parent_class,
-        signature: result.data.signature,
-        return_type: result.data.return_type,
-        route_path: result.data.route_path,
-        route_method: result.data.route_method,
+        name: snippet.name,
+        qualified_name: snippet.qualified_name,
+        label: snippet.label,
+        file_path: snippet.file_path ?? snippet.file ?? snippet.path,
+        start_line: numberProp(snippet, "start_line"),
+        end_line: numberProp(snippet, "end_line"),
+        parent_class: snippet.parent_class,
+        signature: snippet.signature,
+        return_type: snippet.return_type,
+        route_path: snippet.route_path,
+        route_method: snippet.route_method,
       }) as Partial<SearchCandidate>;
     })();
 
@@ -301,7 +321,7 @@ export class SymbolService {
   }
 
   async resolveCandidates(params: Record<string, unknown>, ctx: ToolExecutionContext): Promise<SymbolResolution> {
-    const args = await this.withProject(stripOutputControls(params), ctx);
+    const args = await this.resolver.withProject(stripOutputControls(params), ctx);
     const project = String(args.project ?? "");
     const name = typeof args.name === "string" ? args.name.trim() : "";
     const qualifiedName = typeof args.qualified_name === "string" ? args.qualified_name.trim() : "";
@@ -319,7 +339,7 @@ export class SymbolService {
 
     const results = await Promise.all(
       searches.map((search) =>
-        this.cbm.callTool("search_graph", removeUndefined({ project, limit: Math.max(limit, 20), ...search }), {
+        this.cbm.callTool("search_graph", removeUndefined({ project, limit: Math.max(limit, 20), fields: SEARCH_GRAPH_FIELDS, ...search }), {
           signal: ctx.signal,
           timeoutMs: queryTimeoutMs(params.timeout_ms),
           allowError: true,
@@ -329,6 +349,10 @@ export class SymbolService {
 
     const candidates = results.flatMap((result) => (result.ok ? allSearchCandidates(result.data) : []));
     const stderr = results.map((result) => result.stderr).join("");
+
+    // Every lookup failing is a cbm/contract error (bad project, bad regex, ...),
+    // not an empty result set. Partial failures are tolerated.
+    if (results.every((result) => !result.ok)) throw await this.resolver.projectLookupError(results[0]!.data, project, ctx);
 
     const deduped = dedupeCandidates(candidates);
     const filtered = filterCandidates(deduped, args).slice(0, limit);
@@ -376,7 +400,7 @@ export class SymbolService {
 
   async getSnippets(params: Record<string, unknown>, ctx: ToolExecutionContext) {
     const qualifiedNames = stringsArrayParam(params.qualified_names, "qualified_names", MAX_BATCH_SNIPPETS);
-    const args = await this.withProject(stripOutputControls({ project: params.project }), ctx);
+    const args = await this.resolver.withProject(stripOutputControls({ project: params.project }), ctx);
     const project = String(args.project ?? "");
     const concurrency = batchConcurrency(params.max_concurrency, 8, 16);
 
@@ -416,7 +440,7 @@ export class SymbolService {
 
   async readMany(params: Record<string, unknown>, ctx: ToolExecutionContext) {
     const requests = symbolRequestsParam(params.symbols);
-    const args = await this.withProject(stripOutputControls({ project: params.project }), ctx);
+    const args = await this.resolver.withProject(stripOutputControls({ project: params.project }), ctx);
     const project = String(args.project ?? "");
     const concurrency = batchConcurrency(params.max_concurrency, 4, 12);
 
@@ -462,7 +486,7 @@ export class SymbolService {
       neighbor_limit: undefined,
       timeout_ms: undefined,
     });
-    const args = await this.withProject(upstream, ctx);
+    const args = await this.resolver.withProject(upstream, ctx);
     const project = String(args.project ?? "");
 
     const search = await this.cbm.callTool("search_graph", args, { signal: ctx.signal, timeoutMs: queryTimeoutMs(params.timeout_ms) });
@@ -520,11 +544,6 @@ export class SymbolService {
     });
   }
 
-  private async withProject<T extends Record<string, unknown>>(params: T, ctx: ToolExecutionContext): Promise<Record<string, unknown>> {
-    if (typeof params.project === "string" && params.project.trim()) return removeUndefined(params);
-    return removeUndefined({ ...params, project: await this.projects.inferProject(ctx.cwd, ctx.signal) });
-  }
-
   private async readQualifiedName(
     qualifiedName: string,
     project: string,
@@ -539,8 +558,9 @@ export class SymbolService {
       allowError: true,
     });
 
-    if (!snippet.ok) throw new Error(errorText(snippet.data));
-    return { data: isRecord(snippet.data) ? snippet.data : { snippet: snippet.data }, stderr: snippet.stderr };
+    if (!snippet.ok) throw await this.resolver.projectLookupError(snippet.data, project, ctx);
+    const data = isRecord(snippet.data) ? ((await this.catalog.relativizePaths(snippet.data, project, ctx.signal)) as Record<string, unknown>) : { snippet: snippet.data };
+    return { data, stderr: snippet.stderr };
   }
 
   private async readResolvedCandidate(candidate: SearchCandidate, project: string, params: Record<string, unknown>, ctx: ToolExecutionContext): Promise<BatchCallResult> {

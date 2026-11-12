@@ -1,7 +1,9 @@
 import { mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, formatSize, truncateHead } from "@earendil-works/pi-coding-agent";
+import { DEFAULT_MAX_BYTES, DEFAULT_MAX_LINES, truncateHead } from "@earendil-works/pi-coding-agent";
+import { formatSize } from "../shared/strings.js";
+import type { CbmData } from "./normalize.js";
 
 export type CbmCallOptions = {
   timeoutMs?: number;
@@ -11,7 +13,7 @@ export type CbmCallOptions = {
 
 export type CbmCallResult = {
   ok: boolean;
-  data: unknown;
+  data: CbmData;
   rawText: string;
   stderr: string;
 };

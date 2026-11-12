@@ -1,13 +1,29 @@
 import { spawn } from "node:child_process";
-import { formatSize } from "@earendil-works/pi-coding-agent";
 import { resolveCbmBinary } from "./binary.js";
 import { parseCbmEnvelope, parseMaybeJson } from "./envelope.js";
+import { CbmToolError } from "./errors.js";
+import { normalizeCbmData } from "./normalize.js";
 import type { CbmCallOptions, CbmCallResult } from "./result.js";
 import { DEFAULT_QUERY_TIMEOUT_MS } from "./timeouts.js";
+import { CbmVersionGate, type CbmVersionCheck, type CbmVersionNotice } from "./version.js";
+import { cbmEnv } from "../shared/env.js";
+import { formatSize } from "../shared/strings.js";
 
 const MAX_STDIO_BYTES = 50 * 1024 * 1024;
 
 export class CbmClient {
+  constructor(private readonly versionGate = new CbmVersionGate()) {}
+
+  /** Probe the configured binary's version (once per binary; see `takeVersionNotices`). */
+  async checkVersion(signal?: AbortSignal): Promise<CbmVersionCheck> {
+    return this.versionGate.check(await resolveCbmBinary(), signal);
+  }
+
+  /** Compatibility notices (too old, untested newer, unknown version) not yet shown to the user. */
+  takeVersionNotices(): CbmVersionNotice[] {
+    return this.versionGate.takeNotices();
+  }
+
   async findGitRoot(cwd: string, signal?: AbortSignal): Promise<string | undefined> {
     const child = spawn("git", ["rev-parse", "--show-toplevel"], {
       cwd,
@@ -36,17 +52,40 @@ export class CbmClient {
     }
   }
 
-  async gitRoot(cwd: string, signal?: AbortSignal): Promise<string> {
-    return (await this.findGitRoot(cwd, signal)) ?? cwd;
-  }
-
   async callTool(toolName: string, args: Record<string, unknown>, options: CbmCallOptions = {}): Promise<CbmCallResult> {
     const binary = await resolveCbmBinary();
+    const version = await this.versionGate.check(binary, options.signal);
+    if (version.status === "too-old") {
+      throw new Error(version.message ?? `codebase-memory-mcp ${version.version ?? "?"} is unsupported`);
+    }
+
+    // 0.12 ignores `format` on stdin for list_projects, so that one uses the flag and no stdin.
+    // limit/offset are forwarded as flags so callers can page past cbm's default 50; other args stay dropped.
+    const argv = ["cli", "--json", toolName];
+    let stdin: string | undefined;
+    if (toolName === "list_projects") {
+      argv.push("--format", "json");
+      for (const flag of ["limit", "offset"] as const) {
+        const value = args[flag];
+        if (typeof value === "number" && Number.isInteger(value)) argv.push(`--${flag}`, String(value));
+      }
+    } else {
+      stdin = JSON.stringify({ format: "json", ...args });
+    }
+
+    if (options.signal?.aborted) throw new Error(`codebase-memory-mcp ${toolName} cancelled`);
+
     const timeoutMs = options.timeoutMs ?? DEFAULT_QUERY_TIMEOUT_MS;
-    const child = spawn(binary, ["cli", "--json", toolName, JSON.stringify(args)], {
-      stdio: ["ignore", "pipe", "pipe"],
+    const child = spawn(binary, argv, {
+      stdio: [stdin === undefined ? "ignore" : "pipe", "pipe", "pipe"],
       windowsHide: true,
+      env: resolveCbmEnvironment(),
     });
+
+    if (stdin !== undefined) {
+      child.stdin?.on("error", () => {});
+      child.stdin?.end(stdin);
+    }
 
     let stdout = "";
     let stderr = "";
@@ -87,9 +126,9 @@ export class CbmClient {
       }
 
       const { envelope, text } = parseCbmEnvelope(stdout);
-      const data = parseMaybeJson(text);
+      const data = normalizeCbmData(parseMaybeJson(text));
       const ok = envelope.isError !== true;
-      if (!ok && !options.allowError) throw new Error(typeof data === "string" ? data : JSON.stringify(data));
+      if (!ok && !options.allowError) throw new CbmToolError(toolName, data);
 
       return { ok, data, rawText: text, stderr };
     } finally {
@@ -97,4 +136,11 @@ export class CbmClient {
       options.signal?.removeEventListener("abort", kill);
     }
   }
+}
+
+function resolveCbmEnvironment(): NodeJS.ProcessEnv | undefined {
+  // Only PI_CBM_CACHE_DIR needs forwarding: a CBM_CACHE_DIR set directly is inherited as is.
+  const cacheDirectory = cbmEnv("CACHE_DIR");
+  if (!cacheDirectory) return undefined;
+  return { ...process.env, CBM_CACHE_DIR: cacheDirectory };
 }
